@@ -1,0 +1,14 @@
+# Build output
+build/
+out/
+cmake-build-*/
+CMakeUserPresets.json
+
+# Visual Studio and VS Code
+.vs/
+.vscode/
+*.user
+
+# Images and frames written by --screenshot and --record
+*.ppm
+frames/

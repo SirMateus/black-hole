@@ -1,0 +1,517 @@
+#version 430
+// ===========================================================================
+//  Kerr (spinning) black hole ray tracer
+// ===========================================================================
+//  Units: G = c = 1 and M = 0.5, so the Schwarzschild radius Rs = 2M = 1.
+//  a is the spin as a length, a = (a/M) * M, so a <= 0.499.
+//
+//    r+ = M + sqrt(M^2 - a^2)   event horizon (1.0 at a = 0, 0.53 at max spin)
+//    r_isco                     inner edge of the disk: the innermost stable circular orbit
+//                               for gas going round with the spin, called "prograde"
+//                               (3.0 at a = 0, 0.62 at max spin)
+//
+//  COORDINATES: Kerr-Schild (x, y, z, t). y is up, the disk lies in y = 0 and the
+//  hole spins so that the angle atan2(z, x) grows in the prograde direction.
+//  Why these coordinates? They are ordinary Cartesian ones with no special
+//  directions (no trouble at the poles), and unlike Boyer-Lindquist coordinates
+//  nothing goes wrong at the future horizon, the one things fall through, so a
+//  camera can fly straight across it.
+//
+//  METRIC: Kerr spacetime is flat space plus one extra term. For the inverse metric
+//
+//        g^mn = eta^mn - f l^m l^n
+//
+//  f is a number saying how strong gravity is here and l is a light-like direction.
+//
+//  RAYS: a photon is described by its position x and its momentum k_m, with the
+//  index down (a "covariant" vector). Instead of the geodesic equation, which needs
+//  40 Christoffel symbols, we use Hamilton's equations from classical mechanics.
+//  lambda just labels the points along the ray, like time does in mechanics:
+//
+//        H = 1/2 g^mn k_m k_n = 0        (H = 0 says "this is light")
+//        dx^i / dlambda =  dH / dk_i
+//        dk_i / dlambda = -dH / dx^i
+//
+//  Nothing in the metric depends on t or on the angle around the axis, so k_t and
+//  k_phi never change along a ray.
+//
+//  Rays are traced BACKWARDS, from the camera out into the scene, so our k is minus
+//  the real photon's momentum p. Hence k_t = -p_t is the real photon's energy E,
+//  and k_phi = -p_phi is MINUS its angular momentum.
+// ===========================================================================
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(rgba16f, binding = 0) uniform writeonly image2D uOut;
+
+// The camera's local frame, calculated on the CPU (src/kerr.hpp). Each vector holds
+// the lowered components (k_x, k_y, k_z, k_t) of one axis of the observer's tetrad.
+uniform vec3  uCamPos;
+uniform vec4  uFrameTime, uFrameRight, uFrameUp, uFrameForward;
+uniform float uTanHalfFov;
+uniform float uTime;
+uniform int   uShowDisk, uShowGrid, uDoppler, uMaxSteps, uCamInside;
+uniform float uA;             // spin as a length
+uniform float uRPlus;         // event horizon radius
+uniform float uStepTol;       // integrator tolerance: smaller = more accurate, slower
+uniform float uDiskInner, uDiskOuter, uEscapeRadius;
+uniform float uAutoExposure;
+
+const float M = 0.5;
+
+// ---------------------------------------------------------------------------
+// Noise helpers (procedural texture for the disk and starfield)
+// ---------------------------------------------------------------------------
+float hash13(vec3 p) {
+    p = fract(p * 0.1031);
+    p += dot(p, p.zyx + 31.32);
+    return fract((p.x + p.y) * p.z);
+}
+vec3 hash33(vec3 p) {
+    p = fract(p * vec3(0.1031, 0.1030, 0.0973));
+    p += dot(p, p.yxz + 33.33);
+    return fract((p.xxy + p.yxx) * p.zyx);
+}
+float valueNoise3(vec3 p) {
+    vec3 i = floor(p), f = fract(p);
+    f = f * f * (3.0 - 2.0 * f);
+    return mix(mix(mix(hash13(i + vec3(0,0,0)), hash13(i + vec3(1,0,0)), f.x),
+                   mix(hash13(i + vec3(0,1,0)), hash13(i + vec3(1,1,0)), f.x), f.y),
+               mix(mix(hash13(i + vec3(0,0,1)), hash13(i + vec3(1,0,1)), f.x),
+                   mix(hash13(i + vec3(0,1,1)), hash13(i + vec3(1,1,1)), f.x), f.y), f.z);
+}
+float fbm(vec3 p) {
+    float v = 0.0, a = 0.5;
+    for (int i = 0; i < 5; ++i) { v += a * valueNoise3(p); p *= 2.03; a *= 0.5; }
+    return v;
+}
+
+// ---------------------------------------------------------------------------
+// Blackbody colour (approximation of a Planck spectrum seen by the eye).
+// T in Kelvin, returns roughly normalised RGB as linear light.
+// ---------------------------------------------------------------------------
+vec3 blackbody(float T) {
+    T = clamp(T, 1000.0, 40000.0) / 100.0;
+    vec3 c;
+    c.r = T <= 66.0 ? 1.0 : clamp(1.2929 * pow(T - 60.0, -0.1332), 0.0, 1.0);
+    c.g = T <= 66.0 ? clamp(0.3901 * log(T) - 0.6318, 0.0, 1.0)
+                    : clamp(1.1298 * pow(T - 60.0, -0.0755), 0.0, 1.0);
+    c.b = T >= 66.0 ? 1.0 : (T <= 19.0 ? 0.0 : clamp(0.5432 * log(T - 10.0) - 1.1963, 0.0, 1.0));
+    // This fit gives colours for the screen, with gamma already in them. Everything here is
+    // linear light until the final pass adds gamma, so take it out again, or the gas looks pale.
+    return pow(c, vec3(2.2));
+}
+
+// ---------------------------------------------------------------------------
+// Background: procedural stars + a faint galactic band
+// ---------------------------------------------------------------------------
+vec3 starLayer(vec3 d, float scale, float density) {
+    vec3 p = d * scale;
+    vec3 cell = floor(p);
+    vec3 h = hash33(cell);
+    if (h.x > density) return vec3(0);
+    vec3 starPos = cell + 0.2 + 0.6 * h;           // random point inside the cell
+    float dist = length(p - starPos);
+    float b = exp(-dist * dist * 60.0) * (0.3 + 2.5 * pow(h.y, 6.0));
+    vec3 tint = mix(vec3(1.0, 0.75, 0.55), vec3(0.65, 0.8, 1.0), h.z);
+    return b * tint;
+}
+
+vec3 background(vec3 d) {
+    vec3 col = starLayer(d, 120.0, 0.12) + starLayer(d, 260.0, 0.10) * 0.6 + starLayer(d, 500.0, 0.08) * 0.4;
+    // Galactic band along a tilted great circle
+    vec3 n = normalize(vec3(0.25, 1.0, 0.35));
+    float t = dot(d, n) * 4.0;
+    float band = exp(-t * t);
+    float dust = fbm(d * 6.0);
+    col += band * (0.015 + 0.04 * dust * dust) * mix(vec3(0.55, 0.6, 1.0), vec3(1.0, 0.85, 0.7), dust);
+    return col;
+}
+
+// ---------------------------------------------------------------------------
+// Accretion disk emission at a point in the disk plane (y = 0).
+// E is the ray's conserved energy and kPhi is minus its angular momentum.
+// Returns rgb in .rgb and opacity in .a
+// ---------------------------------------------------------------------------
+vec4 diskEmission(vec3 hit, float E, float kPhi) {
+    // On the plane y = 0 the squashed spheres of constant r are circles of radius
+    // sqrt(r^2 + a^2), so r is not simply length(hit.xz)
+    float r2 = dot(hit.xz, hit.xz) - uA * uA;
+    if (!(r2 > 0.0)) return vec4(0);
+    float r = sqrt(r2);
+    if (!(r >= uDiskInner && r <= uDiskOuter)) return vec4(0);
+
+    // Thin-disk flux profile (the Newtonian Shakura-Sunyaev shape):
+    //   F(r) ~ r^-3 * (1 - sqrt(r_in / r))      -> zero at ISCO, peaks just outside it
+    // Scaled so the peak is 1 for a non-spinning hole, where r_in = 3. Gas far out shines about
+    // the same at any spin, but the disk now reaches deeper into the well, where the flux climbs
+    // steeply: the peak is 2.8 at a = 0.5, 17 at a = 0.9 and 114 at a = 0.998.
+    float y = 3.0 / r;
+    float fluxMax = 0.0567;                        // peak of x^3 (1 - sqrt(x)), at r = 49/36 r_in
+    float flux = y * y * y * (1.0 - sqrt(uDiskInner / r)) / fluxMax;
+
+    // Local temperature T ~ F^(1/4): about 4800 K at a = 0, 15700 K at a = 0.998.
+    // The full relativistic Novikov-Thorne peak would be about 32% hotter still at maximum spin.
+    float T = 4800.0 * pow(max(flux, 1e-4), 0.25);
+
+    // Circular orbit in the equatorial plane of Kerr, in terms of what a clock far away sees:
+    //   Omega = sqrt(M) / (r^(3/2) + a sqrt(M))                  angular speed dphi/dt
+    //   u^t   = (1 + a sqrt(M) r^(-3/2)) / sqrt(1 - 3M/r + 2 a sqrt(M) r^(-3/2))     dt/dtau
+    // u^t is time dilation: orbital speed and gravity together. At a = 0 these are the
+    // familiar Omega = sqrt(M / r^3) and u^t = 1 / sqrt(1 - 3M/r).
+    float sqrtM = sqrt(M), r32 = r * sqrt(r);
+    float omega = sqrtM / (r32 + uA * sqrtM);
+    float ut = (1.0 + uA * sqrtM / r32) / sqrt(1.0 - 3.0 * M / r + 2.0 * uA * sqrtM / r32);
+
+    // Turbulent texture that orbits with the gas (rotate the sample point backwards in time).
+    // The 1.5 speeds it up for looks. The redshift below uses the true orbital speed.
+    float ang = atan(hit.z, hit.x) - omega * uTime * 1.5;
+    vec3 q = vec3(r * cos(ang), r * sin(ang), r * 0.35);
+    float turb = fbm(q * 0.9) * 0.65 + fbm(vec3(r * 3.0, q.xy * 0.25)) * 0.55;
+    float rings = 0.88 + 0.12 * sin(r * 5.0 + turb * 9.0);
+    float density = clamp(turb * rings * 1.4, 0.0, 1.5);
+
+    float intensity = flux;
+
+    if (uDoppler == 1) {
+        // Redshift factor g = (frequency the camera sees) / (frequency the gas emitted).
+        // A frequency measured by an observer is minus the dot product of the photon's
+        // momentum p with that observer's 4-velocity. Our k is -p, so the two minus signs
+        // cancel. We scaled the ray so that the camera measures exactly 1. The gas has
+        // 4-velocity u = u^t (d_t + Omega d_phi), and since k_t = E and k_phi are conserved
+        // along the ray, the emitted frequency is simply
+        //
+        //      u^t (E + Omega k_phi)
+        //
+        // This one line contains all of it: Doppler shift from the orbit, gravitational
+        // redshift, frame dragging, and the motion of the camera itself.
+        float g = 1.0 / (ut * (E + omega * kPhi));
+        if (!(g > 0.0 && g < 1e4)) return vec4(0);  // impossible for real gas: float rounding
+        T *= g;                       // colour shifts bluer when approaching, redder when receding
+        intensity *= g * g * g * g;   // relativistic beaming: brightness ~ g^4
+    }
+
+    // The true brightness range is far more than a screen can show. Close to a fast-spinning
+    // hole g reaches 20 and more, which makes g^4 over 100000. So brightness above KNEE grows
+    // only logarithmically. The turbulence comes after this step, so the gas keeps its texture
+    // where it is brightest, and since the colour is untouched, hot gas stays blue.
+    const float KNEE = 2.5;
+    if (intensity > KNEE) intensity = KNEE * (1.0 + 0.45 * log(intensity / KNEE));
+
+    vec3 col = blackbody(T) * intensity * density * 1.3;
+
+    // Soft edges + patchy opacity so we can see the lensed far side through gaps.
+    // The inner softening scales with r_in, or it would hide the flux peak at high spin.
+    float edge = smoothstep(uDiskInner, uDiskInner * (1.0 + 0.4 / 3.0), r) * (1.0 - smoothstep(uDiskOuter - 4.0, uDiskOuter, r));
+    float alpha = clamp(edge * (0.35 + 0.65 * density), 0.0, 1.0);
+    return vec4(col * edge, alpha);
+}
+
+// ---------------------------------------------------------------------------
+// Spacetime grid: Flamm's paraboloid  z(r) = 2 sqrt(Rs (r - Rs)),
+// the exact embedding of the equatorial plane of Schwarzschild space. For a spinning
+// hole it is only a schematic funnel, as Kerr has no such simple embedding, but it
+// is drawn below the disk and lensed like everything else, so it still shows the bending.
+// Its height is squashed by GRID_SCALE so that it fits on screen.
+// ---------------------------------------------------------------------------
+const float GRID_BASE = -4.0, GRID_SIZE = 30.0, GRID_SCALE = 0.55;
+
+float gridHeight(float r) {
+    r = max(r, 1.0);
+    return GRID_BASE + GRID_SCALE * (2.0 * sqrt(r - 1.0) - 2.0 * sqrt(GRID_SIZE - 1.0));
+}
+
+vec4 gridColor(vec3 hit, float pathLen) {
+    if (abs(hit.x) > GRID_SIZE || abs(hit.z) > GRID_SIZE) return vec4(0);
+    if (length(hit.xz) < 1.0) return vec4(0);
+    const float SPACING = 2.0;                      // one grid cell = 2 Rs
+    vec2 g = abs(fract(hit.xz / SPACING + 0.5) - 0.5) * SPACING;  // distance to nearest line
+    float width = max(0.025, 0.0022 * pathLen);     // wider when far away -> less aliasing
+    float line = 1.0 - smoothstep(0.0, width, min(g.x, g.y));
+    float fade = 1.0 - smoothstep(GRID_SIZE * 0.6, GRID_SIZE, max(abs(hit.x), abs(hit.z)));
+    return vec4(vec3(0.2, 0.6, 1.0) * line * 0.45 * fade, line * 0.7 * fade);
+}
+
+// ---------------------------------------------------------------------------
+// Hamilton's equations in Kerr-Schild coordinates
+// ---------------------------------------------------------------------------
+//  The radius r is defined by squashed spheres (see src/kerr.hpp):
+//        (x^2 + z^2) / (r^2 + a^2) + y^2 / r^2 = 1
+//  Using S = r^4 + a^2 y^2 and A = r^2 + a^2:
+//        f = 2 M r^3 / S
+//        l = ( (r x + a z)/A,  y/r,  (r z - a x)/A )       l_t = 1, l^t = -1
+//  At a = 0 this is f = Rs/r, with l the radial unit vector: plain Schwarzschild.
+//
+//  Writing L = l^m k_m = dot(l, k) - E, the Hamiltonian becomes simply
+//        H = 1/2 ( |k|^2 - E^2 - f L^2 )
+//  and taking its derivatives gives
+//        dx/dlambda = k - f L l
+//        dk/dlambda = 1/2 L^2 grad(f) + f L grad(l.k)      (grad at constant k)
+//
+//  Each derivative below is written out by hand. That is why this function is cheap:
+//  no matrices, no Christoffel symbols, about 110 floating point operations per call.
+//  One RK4 step calls it four times.
+// ---------------------------------------------------------------------------
+void kerrRHS(vec3 x, vec3 k, float E, out vec3 dx, out vec3 dk, out vec3 gradR, out float r) {
+    float a = uA, a2 = a * a;
+    float y2 = x.y * x.y;
+    float w = dot(x, x) - a2;
+    float r2 = 0.5 * (w + sqrt(w * w + 4.0 * a2 * y2));
+    r = sqrt(r2);
+    float r3 = r2 * r, r4 = r2 * r2;
+    float S = r4 + a2 * y2, A = r2 + a2;
+    float f = 2.0 * M * r3 / S;
+    vec3  l = vec3((r * x.x + a * x.z) / A, x.y / r, (r * x.z - a * x.x) / A);
+    float L = dot(l, k) - E;
+    float fL = f * L;
+    dx = k - fL * l;
+
+    // gradient of r (from differentiating the squashed-sphere equation)
+    gradR = vec3(x.x * r3, x.y * r * A, x.z * r3) / S;
+
+    // gradient of f
+    vec3 gradF = (f / r) * (3.0 - 4.0 * r4 / S) * gradR;
+    gradF.y -= f * 2.0 * a2 * x.y / S;
+
+    // gradient of l.k, holding k fixed: l.k = (r P + a Q)/A + y k_y / r
+    float P = x.x * k.x + x.z * k.z, Q = x.z * k.x - x.x * k.z;
+    float dLdr = P / A - 2.0 * r * (r * P + a * Q) / (A * A) - x.y * k.y / r2;
+    vec3 gradLk = dLdr * gradR;
+    gradLk.x += (r * k.x - a * k.z) / A;
+    gradLk.y += k.y / r;
+    gradLk.z += (r * k.z + a * k.x) / A;
+
+    dk = (0.5 * L * L) * gradF + fL * gradLk;
+}
+
+// ---------------------------------------------------------------------------
+// Where will this ray end up? Answered exactly, before tracing it.
+// ---------------------------------------------------------------------------
+//  Kerr has a third conserved quantity besides E and k_phi: Carter's constant. We use
+//  the form K = Q + (L - a E)^2, where Q is the constant most books call Carter's and
+//  L = -k_phi. With all three, the radial motion obeys one equation,
+//
+//        (Sigma dr/dlambda)^2 = R(r) = E^2 r^4 + C r^2 + 2 M K r + a^2 (b^2 - K)
+//        b = a E + k_phi,   C = 2 a E b - K,   Sigma = r^2 + a^2 cos^2(theta)
+//
+//  R can never be negative along a ray, so a region with R < 0 is a wall (the ray
+//  bounces). The wall, if there is one, is deepest at the largest root of R'(r) = 0,
+//  a cubic we can solve with a cosine formula. So:
+//    * a wall exists and the ray starts below it -> it can only fall in
+//    * a wall exists and the ray starts above it -> it bounces and escapes
+//    * no wall -> it keeps going the way it is already going
+//
+//  Letting this decide "black or sky" means that integration error cannot paint a star
+//  inside the shadow. Only rounding in this one test can, and only exactly on the shadow's
+//  edge: about 1 in 2500 edge pixels at 4K, never deeper than that pixel. The march below
+//  is only needed to find disk hits and the final sky direction.
+// ---------------------------------------------------------------------------
+bool isCaptured(vec3 x, vec3 k, float E, float kPhi, float r, float rdot) {
+    if (E <= 0.0) return true;      // only possible near the hole: can never reach infinity
+    float a = uA, a2 = a * a;
+    float sin2 = (x.x * x.x + x.z * x.z) / (r * r + a2);
+    vec3  J = cross(x, k);
+    float K = dot(J, J) + 2.0 * a * E * kPhi + a2 * (k.x * k.x + k.z * k.z - sin2 * (dot(k, k) - E * E));
+
+    float b = a * E + kPhi, C = 2.0 * a * E * b - K, E2 = E * E;
+
+    // R'(r) = 0 divided by 4 E^2 is r^3 + p r + q = 0
+    float p = C / (2.0 * E2), q = M * K / (2.0 * E2);
+    if (p < 0.0) {
+        float m = 2.0 * sqrt(-p / 3.0);
+        float arg = 3.0 * q / (p * m);
+        if (arg > -1.0) {
+            float rWall = m * cos(acos(min(arg, 1.0)) / 3.0);
+            if (rWall > uRPlus) {
+                float rr = rWall * rWall;
+                float R = E2 * rr * rr + C * rr + 2.0 * M * K * rWall + a2 * (b * b - K);
+                if (R < 0.0) return r < rWall;
+            }
+        }
+    }
+    return !(rdot > 0.0);
+}
+
+// ---------------------------------------------------------------------------
+// Between two steps the ray is a smooth curve. A cubic Hermite curve through both
+// end points and both velocities approximates it to the same accuracy as RK4, without
+// any further force evaluations. A straight line would be up to a pixel or two off on the
+// disk, and worse on the grid, where steps are long and rays can graze the surface.
+// ---------------------------------------------------------------------------
+vec3 hermite(vec3 p0, vec3 v0, vec3 p1, vec3 v1, float h, float t) {
+    float t2 = t * t, t3 = t2 * t;
+    return (2.0 * t3 - 3.0 * t2 + 1.0) * p0 + (t3 - 2.0 * t2 + t) * h * v0
+         + (3.0 * t2 - 2.0 * t3) * p1 + (t3 - t2) * h * v1;
+}
+
+// Solve y(t) = 0 on the Hermite curve with a few Newton iterations
+vec3 hermiteDiskHit(vec3 p0, vec3 v0, vec3 p1, vec3 v1, float h) {
+    float t = p0.y / (p0.y - p1.y);
+    for (int i = 0; i < 3; ++i) {
+        float y = hermite(p0, v0, p1, v1, h, t).y;
+        float t2 = t * t;
+        float dy = (6.0 * t2 - 6.0 * t) * (p0.y - p1.y) + (3.0 * t2 - 4.0 * t + 1.0) * h * v0.y
+                 + (3.0 * t2 - 2.0 * t) * h * v1.y;
+        if (abs(dy) > 1e-12) t = clamp(t - y / dy, 0.0, 1.0);
+    }
+    return hermite(p0, v0, p1, v1, h, t);
+}
+
+float gridGap(vec3 p) { return p.y - gridHeight(length(p.xz)); }
+
+// Solve gridGap = 0 on the Hermite curve with the Illinois method, a bracketing root
+// finder that never leaves [0, 1]. Returns the hit point; t ends up in tHit.
+vec3 hermiteGridHit(vec3 p0, vec3 v0, vec3 p1, vec3 v1, float h, float g0, float g1, out float tHit) {
+    float ta = 0.0, tb = 1.0, fa = g0, fb = g1;
+    int kept = 0;                   // which end survived the last round: 1 = a, 2 = b
+    vec3 hit = p0;
+    tHit = 0.0;
+    for (int i = 0; i < 6; ++i) {
+        tHit = (ta * fb - tb * fa) / (fb - fa);
+        hit = hermite(p0, v0, p1, v1, h, tHit);
+        float ft = gridGap(hit);
+        if (ft * fa > 0.0) { ta = tHit; fa = ft; if (kept == 2) fb *= 0.5; kept = 2; }
+        else               { tb = tHit; fb = ft; if (kept == 1) fa *= 0.5; kept = 1; }
+    }
+    return hit;
+}
+
+void main() {
+    ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(uOut);
+    if (pix.x >= size.x || pix.y >= size.y) return;
+
+    // Direction of this pixel in the camera's own frame: x right, y up, z forward
+    vec2 uv = (vec2(pix) + 0.5) / vec2(size) * 2.0 - 1.0;
+    uv.x *= float(size.x) / float(size.y);
+    vec3 n = normalize(vec3(uv * uTanHalfFov, 1.0));
+
+    // The light reaching the camera has momentum p = e_time - n: it arrives from
+    // direction n, with energy 1 as measured by this observer. We trace it backwards,
+    // which is the same as following k = -p forwards in the affine parameter lambda.
+    // So t decreases along the ray. Energy 1 at the camera makes redshifts easy later on.
+    vec4 kCov = -uFrameTime + n.x * uFrameRight + n.y * uFrameUp + n.z * uFrameForward;
+    vec3 x = uCamPos;
+    vec3 k = kCov.xyz;
+    float E = kCov.w;                              // conserved: never changes along the ray
+    float kPhi = x.x * k.z - x.z * k.x;            // conserved: minus the angular momentum
+
+    vec3  color = vec3(0);
+    float alpha = 0.0;                             // accumulated opacity (front-to-back compositing)
+    float pathLen = 0.0;
+    bool  sky = false;
+
+    // Inside the horizon, r can only grow as we go back in time, up to r+. A ray can only
+    // cross it into our universe if P = E (r+^2 + a^2) + a k_phi > 0. If not, the light
+    // came from the far side of the eternal hole: there is nothing to see, so it is black.
+    // That test is necessary, not enough. Many rays that do cross r+ then turn back, or can't
+    // reach infinity. isCaptured marks those black, and at high spin they are nearly all of it.
+    bool canExit = uCamInside == 0 || E * (uRPlus * uRPlus + uA * uA) + uA * kPhi > 0.0;
+
+    if (canExit) {
+        bool captured = false, diskPending = false, gridPending = false;
+        vec3 xPrev = x, vPrev = k, kGood = k;      // state at the start of the previous step
+        float hPrev = 0.0, gridGap0 = 0.0, gridGap1 = 0.0, lenPrev = 0.0;
+
+        // A captured ray heading inward can stop once nothing is left to hit. The disk ends
+        // at its inner edge, which is always below r = 4, so with the disk on that decides it.
+        // The grid alone can stop at r = 4, as the grid surface stays about twice that far out.
+        float rStop = uShowDisk == 1 ? uDiskInner : (uShowGrid == 1 ? 4.0 : 1e9);
+
+        for (int i = 0; ; ++i) {
+            vec3 dx, dk, gradR;
+            float r;
+            kerrRHS(x, k, E, dx, dk, gradR, r);
+            float rdot = dot(gradR, dx);           // dr/dlambda
+            float delta = r - uRPlus;
+
+            // Surfaces crossed during the last step. Handled here because the curve
+            // through them needs the velocity at the end of the step, which we have now.
+            if (diskPending) {
+                vec4 e = diskEmission(hermiteDiskHit(xPrev, vPrev, x, dx, hPrev), E, kPhi);
+                color += (1.0 - alpha) * e.rgb;
+                alpha += (1.0 - alpha) * e.a;
+                diskPending = false;
+            }
+            if (gridPending) {
+                float tHit;
+                vec3 hit = hermiteGridHit(xPrev, vPrev, x, dx, hPrev, gridGap0, gridGap1, tHit);
+                vec4 gcol = gridColor(hit, pathLen - (1.0 - tHit) * lenPrev);
+                color += (1.0 - alpha) * gcol.rgb;
+                alpha += (1.0 - alpha) * gcol.a * 0.6;
+                gridPending = false;
+            }
+            if (alpha > 0.995) break;
+
+            if (i == 0) captured = isCaptured(x, k, E, kPhi, r, rdot);
+
+            // Safety net: if anything went non-finite, keep the last good momentum
+            if (any(isnan(x)) || any(isnan(k)) || any(isinf(k))) { k = kGood; sky = !captured; break; }
+            kGood = k;
+
+            // Finished? Falling in, well past everything, or out of steps.
+            if ((captured && rdot < 0.0 && r < rStop) || (delta < 0.002 && rdot < 0.0)
+                || (r > uEscapeRadius && rdot > 0.0) || i >= uMaxSteps) {
+                sky = !captured;
+                break;
+            }
+
+            // Step size. Three limits, all measured in the affine parameter lambda:
+            //  1. a coordinate distance that grows with r, as far-away rays are almost straight.
+            //     The 2.8 and 0.2 are tuned values: how far one step goes for a given tolerance.
+            float ds = clamp(min(2.8 * uStepTol, 0.2) * r * (1.0 + r / 10.0), 0.005, 40.0);
+            float h = ds / length(dx);
+            //  2. on the way down, a fraction of the remaining distance to the horizon
+            if (rdot < 0.0 && delta > 0.0) h = min(h, 0.3 * delta / (-rdot));
+            //  3. the momentum must not change by more than a small fraction per step. These
+            //     coordinates only behave at the FUTURE horizon. A ray traced backwards towards
+            //     the hole from outside is really heading for the PAST horizon, where its momentum
+            //     grows without limit, so it must be stopped just outside (the delta test above).
+            //     A captured ray's fate is already known, so it can be a bit coarser (the 1.5).
+            h = min(h, (captured ? 1.5 * uStepTol : uStepTol) * sqrt(dot(k, k) + E * E) / length(dk));
+            // A huge k can overflow length() and give h = 0. The ray's fate is already known,
+            // so end it here instead of spending all its remaining steps standing still.
+            if (!(h > 0.0)) { sky = !captured; break; }
+
+            // One classic 4th-order Runge-Kutta step. The first stage is the dx, dk from above.
+            float h2 = 0.5 * h;
+            vec3 dx2, dk2, dx3, dk3, dx4, dk4, unusedGrad;
+            float unusedR;
+            kerrRHS(x + h2 * dx,  k + h2 * dk,  E, dx2, dk2, unusedGrad, unusedR);
+            kerrRHS(x + h2 * dx2, k + h2 * dk2, E, dx3, dk3, unusedGrad, unusedR);
+            kerrRHS(x + h * dx3,  k + h * dk3,  E, dx4, dk4, unusedGrad, unusedR);
+            vec3 xNew = x + h / 6.0 * (dx + 2.0 * dx2 + 2.0 * dx3 + dx4);
+            vec3 kNew = k + h / 6.0 * (dk + 2.0 * dk2 + 2.0 * dk3 + dk4);
+
+            lenPrev = h * length(dx);
+            pathLen += lenPrev;
+
+            // Did we cross the disk plane (y = 0) during this step?
+            if (uShowDisk == 1) diskPending = (x.y < 0.0) != (xNew.y < 0.0);
+
+            // Did we cross the grid surface?
+            if (uShowGrid == 1) {
+                gridGap0 = gridGap(x);
+                gridGap1 = gridGap(xNew);
+                gridPending = gridGap0 * gridGap1 < 0.0;
+            }
+
+            xPrev = x; vPrev = dx; hPrev = h;
+            x = xNew;
+            k = kNew;
+        }
+    }
+
+    // normalize(k), rather than the velocity, is the better estimate of where the ray is
+    // finally heading: the momentum feels the leftover gravity beyond the escape radius less.
+    // A real camera stopped down for the disk would lose the stars. Here they only drop by the
+    // square root of the exposure, which is a choice for the screen, not physics.
+    if (sky) color += (1.0 - alpha) * background(normalize(k)) / sqrt(uAutoExposure);
+
+    // One bad pixel would spread through the whole mip chain used for bloom
+    if (any(isnan(color)) || any(isinf(color))) color = vec3(0);
+
+    // Close to the hole, blueshift makes the gas far brighter. Like a real camera we stop down
+    // (src/main.cpp measures the frame), before cutting off the extreme highlights.
+    color = min(color * uAutoExposure, vec3(8.0));
+
+    imageStore(uOut, pix, vec4(color, 1.0));
+}

@@ -1,0 +1,22 @@
+# Let git handle line endings, then pin the ones that matter
+* text=auto
+
+*.bat  text eol=crlf
+
+*.cpp  text eol=lf
+*.hpp  text eol=lf
+*.c    text eol=lf
+*.h    text eol=lf
+*.comp text eol=lf
+*.vert text eol=lf
+*.frag text eol=lf
+*.md   text eol=lf
+*.yml  text eol=lf
+.gitattributes text eol=lf
+.gitignore text eol=lf
+*.txt  text eol=lf
+packaging/*.txt text eol=crlf
+
+*.png  binary
+*.gif  binary
+*.mp4  binary
