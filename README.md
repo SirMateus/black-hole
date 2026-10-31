@@ -2,7 +2,7 @@
 
 **A real-time spinning black hole you can fly into. Every pixel is a light ray traced through curved spacetime on your GPU.**
 
-[![Build](https://github.com/OWNER/REPO/actions/workflows/build.yml/badge.svg)](https://github.com/OWNER/REPO/actions/workflows/build.yml)
+[![Build](https://github.com/SirMateus/black-hole/actions/workflows/build.yml/badge.svg)](https://github.com/SirMateus/black-hole/actions/workflows/build.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![Platform: Windows | Linux](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-lightgrey)
 
@@ -16,7 +16,7 @@
 
 ## Download and run
 
-**Windows:** get the zip from the [latest release](https://github.com/OWNER/REPO/releases/latest), unpack it and double-click `black_hole.exe`.
+**Windows:** get the zip from the [latest release](https://github.com/SirMateus/black-hole/releases/latest), unpack it and double-click `black_hole.exe`.
 
 You need a GPU with OpenGL 4.3 or newer (nearly anything from about 2015 on) with an up-to-date driver. The program isn't signed, so Windows may warn you the first time. Click "More info", then "Run anyway".
 
@@ -66,8 +66,8 @@ The window title shows the spin, your distance `r`, which observer is holding th
 Needs CMake 3.24+ and a C++17 compiler. CMake downloads GLFW and GLM by itself.
 
 ```
-git clone https://github.com/OWNER/REPO.git
-cd REPO
+git clone https://github.com/SirMateus/black-hole.git
+cd black-hole
 cmake -B build -S .
 cmake --build build --config Release
 ```
